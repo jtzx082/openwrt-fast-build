@@ -64,8 +64,11 @@ jobs:
       working-directory: openwrt/sdk
       run: |
         make defconfig
-        echo ">>> Compiling custom packages..."
-        make package/compile -j$(nproc) || make package/compile -j1 V=s
+        echo ">>> Compiling ONLY user added packages..."
+        find package -maxdepth 1 -mindepth 1 -type d | grep -v "package/feeds" | grep -v "package/toolchain" | while read dir; do
+            echo ">>> Building $dir ..."
+            make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s
+        done
 
     - name: Move IPKs to Image Builder
       run: |

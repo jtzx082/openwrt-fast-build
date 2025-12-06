@@ -58,6 +58,22 @@ jobs:
       run: |
         chmod +x $GITHUB_WORKSPACE/diy-part.sh
         $GITHUB_WORKSPACE/diy-part.sh
+        
+        # ------------------------------------------------------------------
+        # 【关键修复逻辑】
+        # 1. 修正 nikki 目录名 (SDK 对目录名敏感)
+        if [ -d "package/OpenWrt-nikki" ]; then
+          echo ">>> Renaming package/OpenWrt-nikki to package/nikki..."
+          mv package/OpenWrt-nikki package/nikki
+        fi
+        
+        # 2. 自动补全 luci-app-nikki (OpenWrt-nikki 仓库只有核心，没有界面)
+        if [ ! -d "package/luci-app-nikki" ]; then
+          echo ">>> Auto-cloning missing luci-app-nikki..."
+          git clone --depth 1 https://github.com/nikkinikki-org/luci-app-nikki.git package/luci-app-nikki
+        fi
+        # ------------------------------------------------------------------
+
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -69,16 +85,18 @@ jobs:
         
         echo ">>> Activating packages from packages.list..."
         
-        # 2. 强制开启包 (解决 No rule to make target)
-        # 这里的逻辑是：读取 packages.list，把每一行都转为 .config 中的开启项
+        # 2. 强制开启包
         cat $GITHUB_WORKSPACE/packages.list | grep -v "^#" | grep -v "^$" | grep -v "^-" | while read pkg; do
           # 开启包本身
           echo "CONFIG_PACKAGE_$pkg=m" >> .config
           
-          # 【关键修复】如果是 nikki 相关的，强制开启核心依赖
+          # 【强制开启 Go 依赖】
+          # 如果不显式开启 golang，nikki 会因为缺依赖被自动禁用
           if [[ "$pkg" == *"nikki"* ]]; then
              echo "CONFIG_PACKAGE_nikki=m" >> .config
              echo "CONFIG_PACKAGE_luci-app-nikki=m" >> .config
+             echo "CONFIG_PACKAGE_golang=y" >> .config
+             echo "CONFIG_golang=y" >> .config
           fi
         done
         
@@ -93,8 +111,7 @@ jobs:
         # 查找 package 下用户添加的目录（排除 feeds 和 toolchain）
         find package -maxdepth 1 -mindepth 1 -type d | grep -v "package/feeds" | grep -v "package/toolchain" | while read dir; do
             echo ">>> Building $dir ..."
-            # 【关键修复】去掉了 || true，如果编译失败直接报错，方便排查原因
-            # 使用 V=s 打印详细日志
+            # 编译失败直接报错，方便排查
             make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s
         done
 
@@ -103,7 +120,7 @@ jobs:
         mkdir -p openwrt/ib/packages
         
         echo ">>> Checking generated IPKs..."
-        # 查找 SDK 编译出的所有 ipk
+        # 统计生成的 IPK 数量
         IPK_COUNT=$(find openwrt/sdk/bin/packages -name "*.ipk" | wc -l)
         
         if [ "$IPK_COUNT" -eq "0" ]; then

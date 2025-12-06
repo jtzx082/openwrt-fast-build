@@ -87,5 +87,10 @@ luci-compat
 luci-lib-ipkg
 sing-box
 ucode-mod-digest
+nikki
 luci-app-nikki
+luci-i18n-nikki-zh-cn
+luci-i18n-nikki-zh-tw
+ddns-go
 luci-app-ddns-go
+luci-i18n-ddns-go-zh-cn

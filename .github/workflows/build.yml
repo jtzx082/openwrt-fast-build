@@ -26,7 +26,7 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        # 增加 golang 以防 SDK 需要宿主机的 Go 环境
+        # 增加 golang，防止因缺少 Go 环境导致 nikki 被跳过
         sudo -E apt-get -qq install build-essential ccache ecj fastjar file g++ gawk \
           gettext git java-propose-classpath libelf-dev libncurses5-dev \
           libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
@@ -60,18 +60,15 @@ jobs:
         $GITHUB_WORKSPACE/diy-part.sh
         
         # ------------------------------------------------------------------
-        # 【关键修复逻辑】
-        # 1. 修正 nikki 目录名 (SDK 对目录名敏感)
-        if [ -d "package/OpenWrt-nikki" ]; then
-          echo ">>> Renaming package/OpenWrt-nikki to package/nikki..."
-          mv package/OpenWrt-nikki package/nikki
-        fi
+        # 【关键修复】自动修正官方仓库目录结构
+        # 官方 nikkinikki-org/OpenWrt-nikki 包含核心和界面，无需额外下载
+        # 我们只需要确保它存在，脚本后续会自动找到里面的 luci-app-nikki
         
-        # 2. 自动补全 luci-app-nikki (OpenWrt-nikki 仓库只有核心，没有界面)
-        if [ ! -d "package/luci-app-nikki" ]; then
-          echo ">>> Auto-cloning missing luci-app-nikki..."
-          git clone --depth 1 https://github.com/nikkinikki-org/luci-app-nikki.git package/luci-app-nikki
-        fi
+        # 清理可能存在的错误目录 (防止残留)
+        rm -rf package/luci-app-nikki
+        
+        # 如果用户脚本把官方源下载到了 package/OpenWrt-nikki，保留它即可
+        # 这里的关键是不要去改动它，让后面的 find 命令自己去搜
         # ------------------------------------------------------------------
 
         ./scripts/feeds update -a
@@ -91,7 +88,7 @@ jobs:
           echo "CONFIG_PACKAGE_$pkg=m" >> .config
           
           # 【强制开启 Go 依赖】
-          # 如果不显式开启 golang，nikki 会因为缺依赖被自动禁用
+          # 确保 nikki 不会因为环境检测失败而被禁用
           if [[ "$pkg" == *"nikki"* ]]; then
              echo "CONFIG_PACKAGE_nikki=m" >> .config
              echo "CONFIG_PACKAGE_luci-app-nikki=m" >> .config
@@ -105,14 +102,28 @@ jobs:
         echo ">>> Downloading package sources..."
         make package/downloads -j$(nproc) || true
         
-        # 4. 编译自定义包
+        # 4. 【智能编译】根据 packages.list 精准查找编译路径
         echo ">>> Compiling user added packages..."
         
-        # 查找 package 下用户添加的目录（排除 feeds 和 toolchain）
-        find package -maxdepth 1 -mindepth 1 -type d | grep -v "package/feeds" | grep -v "package/toolchain" | while read dir; do
-            echo ">>> Building $dir ..."
-            # 编译失败直接报错，方便排查
-            make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s
+        cat $GITHUB_WORKSPACE/packages.list | grep -v "^#" | grep -v "^$" | grep -v "^-" | while read pkg; do
+            echo ">>> Locate and build: $pkg"
+            
+            # 在 package 目录下查找该包名的 Makefile 所在的目录
+            # 排除 feeds 目录，只找用户 clone 进来的
+            PKG_PATH=$(find package -name "$pkg" -type d | grep -v "package/feeds" | head -n 1)
+            
+            if [ -z "$PKG_PATH" ]; then
+                # 如果直接用包名找不到目录（比如包名是 luci-app-nikki 但目录叫 OpenWrt-nikki/luci-app-nikki）
+                # 尝试更深度的搜索
+                PKG_PATH=$(find package -path "*/$pkg" -type d | grep -v "package/feeds" | head -n 1)
+            fi
+
+            if [ -n "$PKG_PATH" ]; then
+                echo "    Found path: $PKG_PATH"
+                make "$PKG_PATH/compile" -j$(nproc) || make "$PKG_PATH/compile" -j1 V=s
+            else
+                echo "    WARNING: Could not find directory for package '$pkg'. Skipping..."
+            fi
         done
 
     - name: Check and Move IPKs

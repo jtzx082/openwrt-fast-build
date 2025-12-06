@@ -98,10 +98,10 @@ jobs:
                 # 初始化变量
                 REAL_PKG_PATH=""
                 
-                # 方法 A: 精确查找目录名，并验证 Makefile 是否存在
-                # 这会找到所有匹配的目录，然后我们逐个检查
+                # 查找 package 下所有匹配该包名的目录（排除 feeds）
                 CANDIDATE_PATHS=$(find package -name "$pkg" -type d | grep -v "package/feeds")
                 
+                # 遍历所有候选路径，检查是否存在 Makefile
                 for path in $CANDIDATE_PATHS; do
                     if [ -f "$path/Makefile" ]; then
                         REAL_PKG_PATH="$path"
@@ -109,7 +109,7 @@ jobs:
                     fi
                 done
                 
-                # 方法 B: 如果 A 没找到，尝试模糊搜索 (例如 nikki 在 OpenWrt-nikki/nikki)
+                # 如果没找到，尝试模糊搜索 (例如 nikki 可能在 OpenWrt-nikki/nikki)
                 if [ -z "$REAL_PKG_PATH" ]; then
                    CANDIDATE_PATHS=$(find package -path "*/$pkg" -type d | grep -v "package/feeds")
                    for path in $CANDIDATE_PATHS; do

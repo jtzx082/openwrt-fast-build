@@ -1,0 +1,134 @@
+name: OpenWrt Auto Build & Release
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'packages.list'
+      - 'diy-part.sh'
+      - '.github/workflows/build.yml'
+
+env:
+  # 固件分区大小 (MB)
+  ROOTFS_SIZE: 1024
+  
+  # SDK 和 ImageBuilder 下载地址 (ZST格式)
+  SDK_URL: https://mirror-03.infra.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+  IB_URL: https://mirror-03.infra.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-imagebuilder-24.10.4-x86-64.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Prepare Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        # 增加 zstd 用于解压 .tar.zst
+        sudo -E apt-get -qq install build-essential ccache ecj fastjar file g++ gawk \
+          gettext git java-propose-classpath libelf-dev libncurses5-dev \
+          libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+          python3-dev unzip wget rsync xsltproc zlib1g-dev xz-utils zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        
+        # 设置时区
+        sudo timedatectl set-timezone Asia/Shanghai
+
+    - name: Download & Extract SDK/IB
+      run: |
+        mkdir -p openwrt/sdk openwrt/ib
+        
+        echo ">>> Downloading and extracting SDK..."
+        wget -qO- ${{ env.SDK_URL }} | tar --zstd -xf - -C openwrt/sdk --strip-components=1
+        
+        echo ">>> Downloading and extracting Image Builder..."
+        wget -qO- ${{ env.IB_URL }} | tar --zstd -xf - -C openwrt/ib --strip-components=1
+
+    - name: [SDK] Execute diy-part.sh & Install Feeds
+      working-directory: openwrt/sdk
+      run: |
+        # 赋予脚本执行权限
+        chmod +x $GITHUB_WORKSPACE/diy-part.sh
+        
+        # 执行用户自定义脚本 (在 SDK 根目录下执行)
+        # 脚本内通常包含 git clone 操作
+        $GITHUB_WORKSPACE/diy-part.sh
+        
+        # 更新 feeds 并安装
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: [SDK] Compile Custom Packages
+      working-directory: openwrt/sdk
+      run: |
+        # 生成默认配置
+        make defconfig
+        
+        echo ">>> Compiling custom packages..."
+        # 编译 package 目录下所有刚才 clone 进来的插件
+        # 使用 -j$(nproc) 加速，如果失败则尝试单线程并输出日志
+        make package/compile -j$(nproc) || make package/compile -j1 V=s
+
+    - name: [Transfer] Move IPKs to Image Builder
+      run: |
+        # 将 SDK 编译好的 ipk 复制到 IB 的 packages 目录
+        # Image Builder 会自动识别此目录下的包
+        mkdir -p openwrt/ib/packages
+        find openwrt/sdk/bin/packages -name "*.ipk" -exec cp {} openwrt/ib/packages/ \;
+        
+        echo "=== IPKs Ready for Image Builder ==="
+        ls -lh openwrt/ib/packages/
+
+    - name: [ImageBuilder] Generate Firmware
+      working-directory: openwrt/ib
+      run: |
+        # 读取 packages.list 文件，去除注释和空行，转换为一行空格分隔的字符串
+        PACKAGES_LIST=$(grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | tr '\n' ' ')
+        
+        echo ">>> Target Packages: $PACKAGES_LIST"
+        
+        # 使用 make image 构建
+        # CONFIG_TARGET_ROOTFS_PARTSIZE 控制分区大小
+        make image PROFILE="generic" \
+        PACKAGES="$PACKAGES_LIST" \
+        CONFIG_TARGET_ROOTFS_PARTSIZE=${{ env.ROOTFS_SIZE }} \
+        OPKG_ARGS="--force-checksum --force-signature"
+
+    - name: Organize Firmware Files
+      id: organize
+      run: |
+        mkdir -p firmware
+        mv openwrt/ib/bin/targets/x86/64/* firmware/
+        cd firmware
+        gzip -d *.gz || true # 解压 .gz 方便直接使用 img (可选)
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate Release Tag
+      id: tag
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+
+    - name: Upload Firmware to Release
+      uses: softprops/action-gh-release@v1
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        name: OpenWrt ${{ steps.tag.outputs.release_tag }}
+        body: |
+          Auto-built OpenWrt Firmware using SDK + ImageBuilder.
+          
+          **Target:** x86/64
+          **RootFS Size:** ${{ env.ROOTFS_SIZE }} MB
+          **Source:** OpenWrt 24.10.4
+          **Custom Packages:** Nikki, DDNS-Go, etc.
+        files: firmware/*

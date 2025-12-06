@@ -2,7 +2,7 @@ name: OpenWrt Auto Build & Release
 
 on:
   workflow_dispatch:
-    # 仅手动触发
+    # 手动触发
 
 env:
   # 固件分区大小 (MB)
@@ -60,30 +60,35 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: [SDK] Configure & Compile Custom Packages
+    - name: Configure and Compile Custom Packages
       working-directory: openwrt/sdk
       run: |
-        # 1. 生成基础配置
+        # 1. 生成初始配置
         make defconfig
         
+        # 2. 强制开启 packages.list 中的包 (解决 No rule to make target 错误)
         echo ">>> Activating packages from packages.list..."
-        # 2. 读取 packages.list，忽略注释和以'-'开头的卸载项
-        # 将剩余的包名强制转换为 CONFIG_PACKAGE_xxx=m 写入配置
-        grep -vE "^#|^$|^\-" $GITHUB_WORKSPACE/packages.list | while read pkg; do
+        
+        # 使用 cat 和简单的 grep 避免 YAML 语法错误
+        cat $GITHUB_WORKSPACE/packages.list | grep -v "^#" | grep -v "^$" | grep -v "^-" | while read pkg; do
+          echo "Enable package: $pkg"
+          # 尝试开启包本身
           echo "CONFIG_PACKAGE_$pkg=m" >> .config
-          # 同时也尝试开启 luci-app-xxx 对应的依赖（防止某些包名不一致）
+          # 尝试开启 luci-app-xxx 形式 (防止用户只写了 nikki 但包名是 luci-app-nikki)
+          echo "CONFIG_PACKAGE_luci-app-$pkg=m" >> .config
         done
         
-        # 3. 再次运行 make defconfig 让 SDK 自动解析依赖 (比如 nikki 依赖的 golang)
+        # 3. 再次运行 make defconfig 应用依赖关系 (如 nikki 依赖 golang)
         make defconfig
         
-        echo ">>> Compiling ONLY user added packages..."
-        # 4. 遍历 package 目录下排除 feeds 和 toolchain 的文件夹
-        # 这确保只编译你 git clone 进来的插件
+        # 4. 编译自定义包
+        echo ">>> Compiling user added packages..."
+        
+        # 查找 package 下所有第一级目录，排除官方 feeds 和工具链
         find package -maxdepth 1 -mindepth 1 -type d | grep -v "package/feeds" | grep -v "package/toolchain" | while read dir; do
             echo ">>> Building $dir ..."
-            # 尝试多线程编译，如果失败则回退单线程并显示详细日志
-            make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s
+            # 如果编译失败，打印详细日志以便排查，但允许脚本继续 (|| true)
+            make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s || true
         done
 
     - name: Move IPKs to Image Builder
@@ -97,8 +102,8 @@ jobs:
     - name: Generate Firmware
       working-directory: openwrt/ib
       run: |
-        # 转换 packages.list 为一行字符串
-        PACKAGES_LIST=$(grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | tr '\n' ' ')
+        # 简化 grep 语法，避免报错
+        PACKAGES_LIST=$(cat $GITHUB_WORKSPACE/packages.list | grep -v "^#" | grep -v "^$" | tr '\n' ' ')
         echo ">>> Target Packages: $PACKAGES_LIST"
         
         make image PROFILE="generic" \

@@ -26,10 +26,11 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
+        # 增加 golang 以防 SDK 需要宿主机的 Go 环境
         sudo -E apt-get -qq install build-essential ccache ecj fastjar file g++ gawk \
           gettext git java-propose-classpath libelf-dev libncurses5-dev \
           libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
-          python3-dev unzip wget rsync xsltproc zlib1g-dev xz-utils zstd
+          python3-dev unzip wget rsync xsltproc zlib1g-dev xz-utils zstd golang
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone Asia/Shanghai
@@ -66,43 +67,59 @@ jobs:
         # 1. 生成初始配置
         make defconfig
         
-        # 2. 强制开启 packages.list 中的包 (解决 No rule to make target 错误)
         echo ">>> Activating packages from packages.list..."
         
-        # 使用 cat 和简单的 grep 避免 YAML 语法错误
+        # 2. 强制开启包 (解决 No rule to make target)
+        # 这里的逻辑是：读取 packages.list，把每一行都转为 .config 中的开启项
         cat $GITHUB_WORKSPACE/packages.list | grep -v "^#" | grep -v "^$" | grep -v "^-" | while read pkg; do
-          echo "Enable package: $pkg"
-          # 尝试开启包本身
+          # 开启包本身
           echo "CONFIG_PACKAGE_$pkg=m" >> .config
-          # 尝试开启 luci-app-xxx 形式 (防止用户只写了 nikki 但包名是 luci-app-nikki)
-          echo "CONFIG_PACKAGE_luci-app-$pkg=m" >> .config
+          
+          # 【关键修复】如果是 nikki 相关的，强制开启核心依赖
+          if [[ "$pkg" == *"nikki"* ]]; then
+             echo "CONFIG_PACKAGE_nikki=m" >> .config
+             echo "CONFIG_PACKAGE_luci-app-nikki=m" >> .config
+          fi
         done
         
-        # 3. 再次运行 make defconfig 应用依赖关系 (如 nikki 依赖 golang)
+        # 3. 应用配置并下载依赖
         make defconfig
+        echo ">>> Downloading package sources..."
+        make package/downloads -j$(nproc) || true
         
         # 4. 编译自定义包
         echo ">>> Compiling user added packages..."
         
-        # 查找 package 下所有第一级目录，排除官方 feeds 和工具链
+        # 查找 package 下用户添加的目录（排除 feeds 和 toolchain）
         find package -maxdepth 1 -mindepth 1 -type d | grep -v "package/feeds" | grep -v "package/toolchain" | while read dir; do
             echo ">>> Building $dir ..."
-            # 如果编译失败，打印详细日志以便排查，但允许脚本继续 (|| true)
-            make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s || true
+            # 【关键修复】去掉了 || true，如果编译失败直接报错，方便排查原因
+            # 使用 V=s 打印详细日志
+            make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s
         done
 
-    - name: Move IPKs to Image Builder
+    - name: Check and Move IPKs
       run: |
         mkdir -p openwrt/ib/packages
-        # 查找 SDK 编译出的所有 ipk 并移动
+        
+        echo ">>> Checking generated IPKs..."
+        # 查找 SDK 编译出的所有 ipk
+        IPK_COUNT=$(find openwrt/sdk/bin/packages -name "*.ipk" | wc -l)
+        
+        if [ "$IPK_COUNT" -eq "0" ]; then
+          echo "ERROR: No IPK files were generated! Compilation failed."
+          exit 1
+        fi
+        
         find openwrt/sdk/bin/packages -name "*.ipk" -exec cp {} openwrt/ib/packages/ \;
+        
         echo "=== IPKs Ready for Image Builder ==="
         ls -lh openwrt/ib/packages/
 
     - name: Generate Firmware
       working-directory: openwrt/ib
       run: |
-        # 简化 grep 语法，避免报错
+        # 生成包列表字符串
         PACKAGES_LIST=$(cat $GITHUB_WORKSPACE/packages.list | grep -v "^#" | grep -v "^$" | tr '\n' ' ')
         echo ">>> Target Packages: $PACKAGES_LIST"
         

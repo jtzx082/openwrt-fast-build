@@ -2,7 +2,7 @@ name: OpenWrt Build & Release
 
 on:
   workflow_dispatch:
-    # 仅允许手动触发，修改文件不自动运行
+    # 仅允许手动触发
 
 env:
   # 固件分区大小 (MB)
@@ -25,7 +25,7 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        # 安装必要的编译依赖，包括 zstd (解压用) 和 golang (nikki 需要)
+        # 安装必要的编译依赖
         sudo -E apt-get -qq install build-essential ccache ecj fastjar file g++ gawk \
           gettext git java-propose-classpath libelf-dev libncurses5-dev \
           libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
@@ -69,9 +69,7 @@ jobs:
         echo ">>> Configuring packages from packages.list..."
         
         # 2. 强制开启 packages.list 中的包
-        # 过滤掉注释行和空行
         grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | while read pkg; do
-          # 忽略以 - 开头的删除项
           if [[ $pkg != -* ]]; then
             echo "CONFIG_PACKAGE_$pkg=m" >> .config
             
@@ -83,37 +81,51 @@ jobs:
           fi
         done
         
-        # 3. 应用配置，让 SDK 解析依赖关系
+        # 3. 应用配置
         make defconfig
         
-        # 4. 下载源码 (防止编译时网络超时)
+        # 4. 下载源码
         echo ">>> Downloading sources..."
         make package/downloads -j$(nproc) || true
         
-        # 5. 【智能编译】根据包名查找真实路径进行编译
+        # 5. 【智能编译 - 修复路径误判】
         echo ">>> Compiling custom packages..."
         
         grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | while read pkg; do
-            # 忽略以 - 开头的包和官方基础包(假设官方包不需要重编译，除非是 feeds 里的)
-            # 这里我们只尝试编译用户自定义的包，避免编译整个系统
             if [[ $pkg != -* ]]; then
                 echo ">>> Searching for package: $pkg"
                 
-                # 在 package 目录查找对应的 Makefile 所在目录
-                # 排除 feeds/base 等官方目录，优先查找用户 clone 的目录
-                PKG_PATH=$(find package -name "$pkg" -type d | grep -v "package/feeds" | head -n 1)
+                # 初始化变量
+                REAL_PKG_PATH=""
                 
-                # 如果找不到，尝试深度搜索 (例如 nikki 在 OpenWrt-nikki/nikki 下)
-                if [ -z "$PKG_PATH" ]; then
-                   PKG_PATH=$(find package -path "*/$pkg" -type d | grep -v "package/feeds" | head -n 1)
+                # 方法 A: 精确查找目录名，并验证 Makefile 是否存在
+                # 这会找到所有匹配的目录，然后我们逐个检查
+                CANDIDATE_PATHS=$(find package -name "$pkg" -type d | grep -v "package/feeds")
+                
+                for path in $CANDIDATE_PATHS; do
+                    if [ -f "$path/Makefile" ]; then
+                        REAL_PKG_PATH="$path"
+                        break
+                    fi
+                done
+                
+                # 方法 B: 如果 A 没找到，尝试模糊搜索 (例如 nikki 在 OpenWrt-nikki/nikki)
+                if [ -z "$REAL_PKG_PATH" ]; then
+                   CANDIDATE_PATHS=$(find package -path "*/$pkg" -type d | grep -v "package/feeds")
+                   for path in $CANDIDATE_PATHS; do
+                        if [ -f "$path/Makefile" ]; then
+                            REAL_PKG_PATH="$path"
+                            break
+                        fi
+                   done
                 fi
                 
-                if [ -n "$PKG_PATH" ]; then
-                    echo "    Found path: $PKG_PATH"
+                if [ -n "$REAL_PKG_PATH" ]; then
+                    echo "    Found valid package at: $REAL_PKG_PATH"
                     echo "    Compiling..."
-                    make "$PKG_PATH/compile" -j$(nproc) || make "$PKG_PATH/compile" -j1 V=s
+                    make "$REAL_PKG_PATH/compile" -j$(nproc) || make "$REAL_PKG_PATH/compile" -j1 V=s
                 else
-                    echo "    [INFO] Package '$pkg' not found in custom sources or is a system package. Skipping compile step."
+                    echo "    [INFO] Skipped '$pkg': Valid package Makefile not found in custom sources (likely a system package)."
                 fi
             fi
         done
@@ -123,7 +135,6 @@ jobs:
         mkdir -p openwrt/ib/packages
         
         echo ">>> Checking generated IPKs..."
-        # 统计 SDK 编译出的 IPK (排除官方 feeds 里的，只看 bin 目录)
         find openwrt/sdk/bin/packages -name "*.ipk" -exec cp {} openwrt/ib/packages/ \;
         
         COUNT=$(ls openwrt/ib/packages/ | wc -l)
@@ -150,10 +161,8 @@ jobs:
       id: organize
       run: |
         mkdir -p firmware
-        # 移动生成的镜像文件
         mv openwrt/ib/bin/targets/x86/64/* firmware/
         cd firmware
-        # 解压 .gz 文件，方便直接使用 img
         gzip -d *.gz || true
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -172,10 +181,9 @@ jobs:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         name: OpenWrt ${{ steps.tag.outputs.release_tag }}
         body: |
-          Auto-built OpenWrt Firmware (SDK + ImageBuilder).
+          Auto-built OpenWrt Firmware.
           
           **Target:** x86/64
           **RootFS:** ${{ env.ROOTFS_SIZE }} MB
           **Source:** OpenWrt 24.10.4
-          **Custom Packages:** Nikki, DDNS-Go
         files: firmware/*

@@ -2,7 +2,7 @@ name: OpenWrt Auto Build & Release
 
 on:
   workflow_dispatch:
-    # 手动触发
+    # 仅手动触发
 
 env:
   # 固件分区大小 (MB)
@@ -60,19 +60,36 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Compile Custom Packages
+    - name: [SDK] Configure & Compile Custom Packages
       working-directory: openwrt/sdk
       run: |
+        # 1. 生成基础配置
         make defconfig
+        
+        echo ">>> Activating packages from packages.list..."
+        # 2. 读取 packages.list，忽略注释和以'-'开头的卸载项
+        # 将剩余的包名强制转换为 CONFIG_PACKAGE_xxx=m 写入配置
+        grep -vE "^#|^$|^\-" $GITHUB_WORKSPACE/packages.list | while read pkg; do
+          echo "CONFIG_PACKAGE_$pkg=m" >> .config
+          # 同时也尝试开启 luci-app-xxx 对应的依赖（防止某些包名不一致）
+        done
+        
+        # 3. 再次运行 make defconfig 让 SDK 自动解析依赖 (比如 nikki 依赖的 golang)
+        make defconfig
+        
         echo ">>> Compiling ONLY user added packages..."
+        # 4. 遍历 package 目录下排除 feeds 和 toolchain 的文件夹
+        # 这确保只编译你 git clone 进来的插件
         find package -maxdepth 1 -mindepth 1 -type d | grep -v "package/feeds" | grep -v "package/toolchain" | while read dir; do
             echo ">>> Building $dir ..."
+            # 尝试多线程编译，如果失败则回退单线程并显示详细日志
             make "$dir/compile" -j$(nproc) || make "$dir/compile" -j1 V=s
         done
 
     - name: Move IPKs to Image Builder
       run: |
         mkdir -p openwrt/ib/packages
+        # 查找 SDK 编译出的所有 ipk 并移动
         find openwrt/sdk/bin/packages -name "*.ipk" -exec cp {} openwrt/ib/packages/ \;
         echo "=== IPKs Ready for Image Builder ==="
         ls -lh openwrt/ib/packages/
@@ -80,6 +97,7 @@ jobs:
     - name: Generate Firmware
       working-directory: openwrt/ib
       run: |
+        # 转换 packages.list 为一行字符串
         PACKAGES_LIST=$(grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | tr '\n' ' ')
         echo ">>> Target Packages: $PACKAGES_LIST"
         

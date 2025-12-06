@@ -68,7 +68,7 @@ jobs:
         
         echo ">>> Configuring packages from packages.list..."
         
-        # 2. 强制开启 packages.list 中的包
+        # 2. 强制开启 packages.list 中的包 (用于生成依赖关系)
         grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | while read pkg; do
           if [[ $pkg != -* ]]; then
             echo "CONFIG_PACKAGE_$pkg=m" >> .config
@@ -84,50 +84,25 @@ jobs:
         # 3. 应用配置
         make defconfig
         
-        # 4. 下载源码
+        # 4. 下载源码 (允许失败，因为部分系统包不需要下载)
         echo ">>> Downloading sources..."
         make package/downloads -j$(nproc) || true
         
-        # 5. 【智能编译 - 修复路径误判】
-        echo ">>> Compiling custom packages..."
+        # 5. 【智能编译 - 终极修复版】
+        # 不再根据包名去搜，而是直接扫描所有包含 Makefile 的自定义目录
+        echo ">>> Scanning and compiling custom packages..."
         
-        grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | while read pkg; do
-            if [[ $pkg != -* ]]; then
-                echo ">>> Searching for package: $pkg"
-                
-                # 初始化变量
-                REAL_PKG_PATH=""
-                
-                # 查找 package 下所有匹配该包名的目录（排除 feeds）
-                CANDIDATE_PATHS=$(find package -name "$pkg" -type d | grep -v "package/feeds")
-                
-                # 遍历所有候选路径，检查是否存在 Makefile
-                for path in $CANDIDATE_PATHS; do
-                    if [ -f "$path/Makefile" ]; then
-                        REAL_PKG_PATH="$path"
-                        break
-                    fi
-                done
-                
-                # 如果没找到，尝试模糊搜索 (例如 nikki 可能在 OpenWrt-nikki/nikki)
-                if [ -z "$REAL_PKG_PATH" ]; then
-                   CANDIDATE_PATHS=$(find package -path "*/$pkg" -type d | grep -v "package/feeds")
-                   for path in $CANDIDATE_PATHS; do
-                        if [ -f "$path/Makefile" ]; then
-                            REAL_PKG_PATH="$path"
-                            break
-                        fi
-                   done
-                fi
-                
-                if [ -n "$REAL_PKG_PATH" ]; then
-                    echo "    Found valid package at: $REAL_PKG_PATH"
-                    echo "    Compiling..."
-                    make "$REAL_PKG_PATH/compile" -j$(nproc) || make "$REAL_PKG_PATH/compile" -j1 V=s
-                else
-                    echo "    [INFO] Skipped '$pkg': Valid package Makefile not found in custom sources (likely a system package)."
-                fi
-            fi
+        # find: 在 package 目录下查找名为 Makefile 的文件
+        # grep -v: 排除官方 feeds 目录和 kernel 目录
+        # xargs dirname: 获取包含 Makefile 的目录路径
+        find package -name Makefile | grep -v "package/feeds" | grep -v "package/kernel" | xargs -r -n1 dirname | sort -u | while read pkg_path; do
+            echo "-------------------------------------------------------"
+            echo ">>> Building detected custom package: $pkg_path"
+            
+            # 执行编译
+            make "$pkg_path/compile" -j$(nproc) || make "$pkg_path/compile" -j1 V=s
+            
+            echo ">>> Build success: $pkg_path"
         done
 
     - name: Transfer IPKs to Image Builder

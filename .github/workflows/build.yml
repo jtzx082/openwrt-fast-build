@@ -2,14 +2,14 @@ name: OpenWrt Auto Build & Release
 
 on:
   workflow_dispatch:
-    # 仅手动触发
+    # 手动触发
 
 env:
   # 固件分区大小 (MB)
   ROOTFS_SIZE: 1024
-  
-  # SDK 和 ImageBuilder 下载地址 (ZST格式)
+  # SDK 下载地址
   SDK_URL: https://mirror-03.infra.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+  # ImageBuilder 下载地址
   IB_URL: https://mirror-03.infra.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-imagebuilder-24.10.4-x86-64.Linux-x86_64.tar.zst
 
 jobs:
@@ -34,17 +34,25 @@ jobs:
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone Asia/Shanghai
 
-    - name: Download & Extract SDK/IB
+    - name: Download and Extract SDK
       run: |
-        mkdir -p openwrt/sdk openwrt/ib
-        
-        echo ">>> Downloading and extracting SDK..."
-        wget -qO- "${{ env.SDK_URL }}" | tar --zstd -xf - -C openwrt/sdk --strip-components=1
-        
-        echo ">>> Downloading and extracting Image Builder..."
-        wget -qO- "${{ env.IB_URL }}" | tar --zstd -xf - -C openwrt/ib --strip-components=1
+        mkdir -p openwrt/sdk
+        echo ">>> Downloading SDK..."
+        wget -q "${{ env.SDK_URL }}" -O sdk.tar.zst
+        echo ">>> Extracting SDK..."
+        tar -I zstd -xf sdk.tar.zst -C openwrt/sdk --strip-components=1
+        rm sdk.tar.zst
 
-    - name: [SDK] Execute diy-part.sh & Install Feeds
+    - name: Download and Extract Image Builder
+      run: |
+        mkdir -p openwrt/ib
+        echo ">>> Downloading Image Builder..."
+        wget -q "${{ env.IB_URL }}" -O ib.tar.zst
+        echo ">>> Extracting Image Builder..."
+        tar -I zstd -xf ib.tar.zst -C openwrt/ib --strip-components=1
+        rm ib.tar.zst
+
+    - name: Execute diy-part.sh and Install Feeds
       working-directory: openwrt/sdk
       run: |
         chmod +x $GITHUB_WORKSPACE/diy-part.sh
@@ -52,21 +60,21 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: [SDK] Compile Custom Packages
+    - name: Compile Custom Packages
       working-directory: openwrt/sdk
       run: |
         make defconfig
         echo ">>> Compiling custom packages..."
         make package/compile -j$(nproc) || make package/compile -j1 V=s
 
-    - name: [Transfer] Move IPKs to Image Builder
+    - name: Move IPKs to Image Builder
       run: |
         mkdir -p openwrt/ib/packages
         find openwrt/sdk/bin/packages -name "*.ipk" -exec cp {} openwrt/ib/packages/ \;
         echo "=== IPKs Ready for Image Builder ==="
         ls -lh openwrt/ib/packages/
 
-    - name: [ImageBuilder] Generate Firmware
+    - name: Generate Firmware
       working-directory: openwrt/ib
       run: |
         PACKAGES_LIST=$(grep -vE "^#|^$" $GITHUB_WORKSPACE/packages.list | tr '\n' ' ')
@@ -101,7 +109,7 @@ jobs:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         name: OpenWrt ${{ steps.tag.outputs.release_tag }}
         body: |
-          Auto-built OpenWrt Firmware using SDK + ImageBuilder.
+          Auto-built OpenWrt Firmware.
           Target: x86/64
           RootFS Size: ${{ env.ROOTFS_SIZE }} MB
         files: firmware/*

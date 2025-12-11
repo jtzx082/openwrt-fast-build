@@ -1,5 +1,6 @@
 name: Build Nikki for OpenWrt x86_64
 
+# 仅保留手动触发
 on:
   workflow_dispatch:
     inputs:
@@ -7,11 +8,6 @@ on:
         description: 'SSH connection to Actions'
         required: false
         default: 'false'
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "README.md"
 
 env:
   SDK_URL: https://mirror-03.infra.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
@@ -30,9 +26,15 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        # 修复点：不要删除 /etc/apt/sources.list.d/*，否则会导致 apt 找不到源
+        # 仅删除不需要的大型组件以节省空间
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        
+        # 更新软件源并安装依赖
         sudo apt-get -qq update
         sudo apt-get -qq install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc rsync wget unzip zstd file
+        
+        # 设置时区
         sudo timedatectl set-timezone "$TZ"
 
     - name: Download and Extract SDK
@@ -42,30 +44,26 @@ jobs:
         echo "Extracting SDK..."
         tar -I zstd -xf sdk.tar.zst
         rm sdk.tar.zst
-        # 重命名解压后的目录为 openwrt-sdk 以方便后续调用
         SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk*")
         mv "$SDK_DIR" openwrt-sdk
 
     - name: Update Feeds & Add Nikki Source
       working-directory: ./openwrt-sdk
       run: |
-        # 更新官方 feeds 以确保能下载到 golang 等依赖
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-
-        # 克隆 nikki 源码到 package 目录
+        
+        # 克隆 nikki 源码
         git clone --depth 1 $NIKKI_URL package/nikki
         
-        # 再次更新安装 feeds 确保 nikki 的依赖关系被识别
+        # 再次更新 feeds
         ./scripts/feeds install -a
 
     - name: Compile Nikki Plugin
       working-directory: ./openwrt-sdk
       run: |
         echo "Starting Compilation..."
-        # 仅编译 nikki 及其依赖
-        # -j$(nproc) 利用多核编译
-        # V=s 显示详细日志以便排错
+        # 编译 nikki
         make package/nikki/compile -j$(nproc) V=s || make package/nikki/compile V=s
 
     - name: Package as .run file
@@ -74,51 +72,35 @@ jobs:
       run: |
         mkdir -p release_output
         
-        # 查找所有编译生成的 ipk 文件 (排除 SDK 自带的签名文件等)
-        # 通常位于 bin/packages/x86_64/base 或 packages 目录下
+        # 收集编译生成的 ipk
         find bin/ -name "nikki*.ipk" -exec cp {} release_output/ \;
         find bin/ -name "luci-app-nikki*.ipk" -exec cp {} release_output/ \;
         find bin/ -name "mihomo*.ipk" -exec cp {} release_output/ \; 
         
-        # 如果 nikki 依赖其他非常规库，也可以在这里添加 cp 命令
-        
         echo "Collected IPKs:"
         ls -lh release_output/
 
-        # --- 制作 .run 安装包逻辑 ---
+        # --- 制作 .run 安装包 ---
         cd release_output
-        
-        # 1. 创建 payload.tar.gz
         tar -zcf payload.tar.gz *.ipk
         
-        # 2. 创建安装脚本头
         cat > install_script.sh << 'EOF'
         #!/bin/sh
         # Nikki Installer for OpenWrt
         export SKIP_LINES=14
-        
-        # Create temp dir
         INSTALL_DIR=/tmp/nikki_install_temp
         mkdir -p $INSTALL_DIR
-        
-        # Extract archive
         tail -n +$SKIP_LINES "$0" | tar -zxf - -C $INSTALL_DIR
-        
-        # Install IPKs
         echo "Installing Nikki packages..."
         cd $INSTALL_DIR
         opkg update
-        # 强制安装，覆盖可能存在的旧配置
         opkg install *.ipk --force-reinstall --force-overwrite
-        
-        # Cleanup
         cd /
         rm -rf $INSTALL_DIR
         echo "Installation Complete!"
         exit 0
         EOF
         
-        # 3. 合并脚本和压缩包生成 .run 文件
         cat install_script.sh payload.tar.gz > nikki-installer-x86_64.run
         chmod +x nikki-installer-x86_64.run
         

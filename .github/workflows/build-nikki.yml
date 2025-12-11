@@ -1,4 +1,4 @@
-name: Build Nikki for OpenWrt x86_64
+name: Build Nikki Full Bundle for OpenWrt x86_64
 
 on:
   workflow_dispatch:
@@ -25,7 +25,6 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 基础环境清理与准备
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo apt-get -qq update
         sudo apt-get -qq install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc rsync wget unzip zstd file
@@ -45,74 +44,111 @@ jobs:
       working-directory: ./openwrt-sdk
       run: |
         echo "Fixing feed sources..."
-        # 替换 git.openwrt.org 为 github.com 镜像，防止网络中断
+        # 强制使用 GitHub 镜像，解决 git.openwrt.org 连接失败问题
         sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf.default
-        
-        # 增加 Git 缓存
         git config --global http.postBuffer 524288000
         
-        echo "Updating feeds..."
+        echo "Updating feeds (Base)..."
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         
-        echo "Cloning Nikki..."
+        echo "Cloning Nikki source..."
         git clone --depth 1 $NIKKI_URL package/nikki
         
-        echo "Refreshing feeds..."
+        echo "Refreshing feeds (Nikki deps)..."
         ./scripts/feeds install -a
 
-    - name: Compile Nikki Plugin
+    - name: Compile Nikki & Dependencies
       working-directory: ./openwrt-sdk
       run: |
-        echo "Starting Configuration..."
-        
-        # --- 关键修复步骤 ---
-        # 强制生成默认配置，避免系统尝试打开 menuconfig 导致 "Error opening terminal"
+        echo "Generating default config..."
+        # 关键：生成默认配置，防止 make menuconfig 弹出导致 'Error opening terminal'
         make defconfig
-        
-        echo "Starting Compilation..."
-        # 编译 nikki
-        make package/nikki/compile -j$(nproc) V=s || make package/nikki/compile V=s
 
-    - name: Package as .run file
+        echo "Compiling Nikki and Mihomo..."
+        # 显式编译 nikki，OpenWrt 的构建系统会自动编译依赖 (如 mihomo)
+        # 使用 -j$(nproc) 加速
+        make package/nikki/compile -j$(nproc) || make package/nikki/compile V=s
+
+    - name: Smart Package Collection & Bundle
       id: package
       working-directory: ./openwrt-sdk
       run: |
         mkdir -p release_output
         
-        # 查找生成的 ipk
+        echo "Collecting IPK files..."
+        
+        # 1. 核心插件 (Nikki)
         find bin/ -name "nikki*.ipk" -exec cp {} release_output/ \;
         find bin/ -name "luci-app-nikki*.ipk" -exec cp {} release_output/ \;
-        find bin/ -name "mihomo*.ipk" -exec cp {} release_output/ \; 
+        find bin/ -name "luci-i18n-nikki*.ipk" -exec cp {} release_output/ \;
         
-        echo "Collected IPKs:"
+        # 2. 核心依赖 (Mihomo/Clash Meta) - Nikki 必须依赖这个才能运行
+        find bin/ -name "mihomo*.ipk" -exec cp {} release_output/ \;
+        
+        # 3. 常见缺失依赖 (证书包等)
+        find bin/ -name "ca-bundle*.ipk" -exec cp {} release_output/ \;
+        
+        # 4. 尝试收集关键内核模块 (如果 SDK 构建了的话)
+        # 注意：SDK 通常不构建所有 kmod，除非 .config 显式选中，但我们会尝试查找生成的
+        find bin/ -name "kmod-nft-tproxy*.ipk" -exec cp {} release_output/ \;
+        find bin/ -name "kmod-nft-socket*.ipk" -exec cp {} release_output/ \;
+        
+        echo "--- Collected Packages ---"
         ls -lh release_output/
+        
+        if [ -z "$(ls -A release_output)" ]; then
+           echo "Error: No packages found!"
+           exit 1
+        fi
 
-        # --- 制作 .run 安装包 ---
+        # --- 制作增强版 .run 安装包 ---
         cd release_output
         tar -zcf payload.tar.gz *.ipk
         
         cat > install_script.sh << 'EOF'
         #!/bin/sh
-        # Nikki Installer for OpenWrt
-        export SKIP_LINES=14
-        INSTALL_DIR=/tmp/nikki_install_temp
+        # Nikki Full Bundle Installer
+        export SKIP_LINES=25
+        INSTALL_DIR=/tmp/nikki_bundle_temp
+        
+        echo "========================================="
+        echo "   Nikki Plugin Installer (x86_64)       "
+        echo "========================================="
+        
         mkdir -p $INSTALL_DIR
+        # 解压 Payload
         tail -n +$SKIP_LINES "$0" | tar -zxf - -C $INSTALL_DIR
-        echo "Installing Nikki packages..."
+        
         cd $INSTALL_DIR
-        opkg update
-        opkg install *.ipk --force-reinstall --force-overwrite
+        echo "[1/2] Updating package lists..."
+        opkg update >/dev/null 2>&1
+        
+        echo "[2/2] Installing packages..."
+        # 按照依赖顺序尝试安装: 先依赖后插件
+        # 即使报错也会尝试继续安装其他包
+        opkg install mihomo*.ipk --force-reinstall --force-overwrite
+        opkg install kmod*.ipk --force-reinstall --force-overwrite 2>/dev/null || echo "Info: Kernel modules skipped or incompatible (Safe to ignore if pre-installed)"
+        opkg install ca-bundle*.ipk --force-reinstall --force-overwrite 2>/dev/null
+        
+        # 最后安装 nikki
+        opkg install nikki*.ipk luci-app-nikki*.ipk luci-i18n-nikki*.ipk --force-reinstall --force-overwrite
+        
+        echo "Cleaning up..."
         cd /
         rm -rf $INSTALL_DIR
-        echo "Installation Complete!"
+        
+        echo "========================================="
+        echo "   Installation Completed!               "
+        echo "   Please refresh your LuCI page.        "
+        echo "========================================="
         exit 0
         EOF
         
-        cat install_script.sh payload.tar.gz > nikki-installer-x86_64.run
-        chmod +x nikki-installer-x86_64.run
+        cat install_script.sh payload.tar.gz > nikki-bundle-x86_64.run
+        chmod +x nikki-bundle-x86_64.run
         
-        echo "PACKAGED_FILE=openwrt-sdk/release_output/nikki-installer-x86_64.run" >> $GITHUB_ENV
+        echo "PACKAGED_FILE=openwrt-sdk/release_output/nikki-bundle-x86_64.run" >> $GITHUB_ENV
         echo "TAG_NAME=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
 
     - name: Upload to Release
@@ -120,10 +156,19 @@ jobs:
       with:
         files: ${{ env.PACKAGED_FILE }}
         tag_name: ${{ env.TAG_NAME }}
-        name: Nikki x86_64 Release ${{ env.TAG_NAME }}
+        name: Nikki x86_64 Full Bundle ${{ env.TAG_NAME }}
         body: |
-          OpenWrt Nikki Plugin (x86_64)
-          SDK: 24.10.4
-          Install: Upload the .run file to your router and execute `sh nikki-installer-x86_64.run`
+          # OpenWrt Nikki Full Bundle (x86_64)
+          
+          **Included Packages:**
+          - Nikki (LuCI App & Core)
+          - Mihomo (Clash Meta Core Binary)
+          - CA-Bundle & Translations
+          
+          **SDK Version:** 24.10.4
+          
+          **How to install:**
+          1. Upload `.run` file to router (`/tmp` or `/root`).
+          2. Run: `sh nikki-bundle-x86_64.run`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
